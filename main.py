@@ -118,6 +118,22 @@ def main():
                     print(f"[{timestamp}] 나: {turn['user']}")
                     print(f"에이전트: {turn['assistant']}")
             continue
+        
+        if user_message == "/clear":
+            confirmation = input(
+                "대화 기록 전체를 삭제할까요? 삭제하려면 '삭제'를 입력하세요: "
+            ).strip()
+            
+            if confirmation == "삭제":
+                conversation_history.clear()
+                save_history(conversation_history)
+                print("대화 기록을 삭제했습니다.")
+            else:
+                print("취소했습니다.")
+                
+            continue
+            
+            
 
         answer = run_agent(user_message)
 
