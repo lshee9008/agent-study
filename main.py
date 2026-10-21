@@ -65,14 +65,20 @@ def find_tool(user_message: str) -> dict | None:
     return None
 
 def run_agent(user_message: str) -> str:
-    """도구를 찾아 실행하고 결과를 반환한다."""
     tool = find_tool(user_message)
     
-    if tool in None:
-        return "아직 그 요청을 처리하는 방법을 몰라요"
+    if tool is None:
+        return "아직 그 요청을 처리하는 방법을 몰라요."
     
-    result = tool["function"]()
+    try:
+        result = tool["function"]()
+    except Exception as error:
+        return f"[{tool['name']} 도구 오류] {error}"
+    
     return f"[{tool['name']} 도구 실행] {result}"
+
+
+        
 
 
 def main():
