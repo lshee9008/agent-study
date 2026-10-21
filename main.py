@@ -111,6 +111,7 @@ def main():
         answer = run_agent(user_message)
 
         conversation_history.append({
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
             "user": user_message,
             "assistant": answer,
         })
