@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 def get_current_time() -> str:
@@ -34,7 +35,6 @@ def main():
     print("에이전트 시작! 종료하려면 '종료'를 입력하세요")
     conversation_history = []
     
-    
     while True:
         user_message = input("나: ").strip()
         
@@ -51,10 +51,18 @@ def main():
 
         print(f"에이전트: {answer}")
     
+    with open("conversation.json", "w", encoding="utf-8") as file:
+        json.dump(conversation_history, file, ensure_ascii=False, indent=2)
+        
+    print("대화 기록을 conversation.json에 저장했어요.")
+    
+    # 이번 실행의 대화 기록 출력
     print("\n이번 대화 기록:")
     for turn in conversation_history:
         print(f"나: {turn['user']}")
         print(f"에이전트: {turn['assistant']}")
+        
+        
         
 if __name__ == "__main__":
     main()
