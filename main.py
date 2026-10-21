@@ -107,6 +107,17 @@ def main():
         if user_message.lower() in {"exit", "종료"}:
             print("에이전트: 다음에 또 만나요!")
             break
+        
+        if user_message == "/history":
+            if not conversation_history:
+                print("저장된 대화가 없습니다.")
+            else:
+                print("\n최근 대화:")
+                for turn in conversation_history[-5:]:
+                    timestamp = turn.get("timestamp", "시각 정보 없음")
+                    print(f"[{timestamp}] 나: {turn['user']}")
+                    print(f"에이전트: {turn['assistant']}")
+            continue
 
         answer = run_agent(user_message)
 
