@@ -56,13 +56,23 @@ def save_history(history: list[dict[str, str]]) -> None:
         json.dump(history, file, ensure_ascii=False, indent=2)
 
 
-def run_agent(user_message: str) -> str:
+def find_tool(user_message: str) -> dict | None:
+    """사용자 메시지에 맞는 도구를 찾는다."""
     for tool in TOOLS:
         if any(keyword in user_message for keyword in tool["keywords"]):
-            result = tool["function"]()
-            return f"[{tool['name']} 도구 실행] {result}"
+            return tool
+        
+    return None
 
-    return "아직 그 요청을 처리하는 방법을 몰라요."
+def run_agent(user_message: str) -> str:
+    """도구를 찾아 실행하고 결과를 반환한다."""
+    tool = find_tool(user_message)
+    
+    if tool in None:
+        return "아직 그 요청을 처리하는 방법을 몰라요"
+    
+    result = tool["function"]()
+    return f"[{tool['name']} 도구 실행] {result}"
 
 
 def main():
