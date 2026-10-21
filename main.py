@@ -1,109 +1,19 @@
-import json
 from datetime import datetime
-from pathlib import Path
+
 from dotenv import load_dotenv
+from langchain.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-HISTORY_FILE = Path("conversation.json")
-
-
+@tool
 def get_current_time() -> str:
-    """현재 시간을 반환하는 도구."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def say_hello() -> str:
-    """인사 도구."""
-    return "안녕하세요! 어떤 걸 도와드릴까요?"
-
-
-TOOLS = [
-    {
-        "name": "time",
-        "description": "현재 날짜와 시간을 알려준다.",
-        "keywords": ["시간"],
-        "function": get_current_time,
-    },
-    {
-        "name": "hello",
-        "description": "사용자에게 인사한다.",
-        "keywords": ["안녕"],
-        "function": say_hello,
-    },
-]
-
-
-def load_history() -> list[dict[str, str]]:
-    """저장된 대화 기록을 불러온다. 파일이 없으면 빈 기록을 반환한다."""
-    if not HISTORY_FILE.exists():
-        return []
-
-    try:
-        with HISTORY_FILE.open("r", encoding="utf-8") as file:
-            return json.load(file)
-        
-        if not isinstance(history, list):
-            print("대화 기록 파일 형식이 올바르지 않아 새 기록으로 시작합니다.")
-            return []
-        
-        return history
-
-    except (json.JSONDecodeError, OSError) as error:
-        print(f"대화 기록을 읽지 못해 새 기록으로 시작합니다: {error}")
-        return []
-
-
-def save_history(history: list[dict[str, str]]) -> None:
-    """대화 기록 전체를 JSON 파일에 저장한다."""
-    with HISTORY_FILE.open("w", encoding="utf-8") as file:
-        json.dump(history, file, ensure_ascii=False, indent=2)
-
-
-def list_tools() -> str:
-    """등록된 도구 이름과 설명을 보여준다."""
-    lines = ["사용 가능한 도구."]
-    
-    for tool in TOOLS:
-        lines.append(f"- {tool['name']}: {tool['description']}")
-        
-    return "\n".join(lines)
-
-def find_tool(user_message: str) -> dict | None:
-    """사용자 메시지에 맞는 도구를 찾는다."""
-    for tool in TOOLS:
-        if any(keyword in user_message for keyword in tool["keywords"]):
-            return tool
-        
-    return None
-
-def run_agent(user_message: str) -> str:
-    if "도움말" in user_message:
-        return list_tools()
-    
-    tool = find_tool(user_message)
-    
-    if tool is None:
-        return "아직 그 요청을 처리하는 방법을 몰라요."
-    
-    try:
-        result = tool["function"]()
-        
-    except Exception as error:
-        return f"[{tool['name']} 도구 오류] {error}"
-    
-    return f"[{tool['name']} 도구 실행] {result}"
-
-
-        
-
+    """사용자가 현재 날짜가 시간을 물으면 현재 날짜와 시간을 알려준다."""
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def main():
     load_dotenv()
     
-    model = ChatGoogleGenerativeAI(
-        model="gemini-3.7-flash",
-        temperature=0.2,
-    )
+    model = ChatGoogleGenerativeAI(model="gemini-3.7-flash")
+    model_with_tools = model.bind_tools([get_current_time])
     
     print("Gemini 에이전트 시작! 종료하려면 '종료'를 입력하세요.")
     
@@ -114,9 +24,24 @@ def main():
             print("에이전트: 다음에 또 만나요!")
             break
 
-        response = model.invoke(user_message)
-        print(f"에이전트: {response.content}")
-
-
+        response = model_with_tools.invoke(user_message)
+        
+        if response.tool_calls:
+            for tool_call in response.tool_calls:
+                print(f"[도구 호출: {tool_call['name']}]")
+                tool_result = get_current_time.invoke(tool_call)
+                print(f"[도구 결과: {tool_result}]")
+                
+            # 도구 결과를 바탕으로 Gemini가 답변을 작성
+            final_response = model.invoke(
+                f"사용자 요청: {user_message}\n"
+                f"도구 결과: {tool_result}\n"
+                "도구 결과를 바탕으로 한국어로 답변해줘."
+            )
+            print(f"에이전트: {final_response.content}")
+        else:
+            print(f"에이전트: {response.content}")
+            
+            
 if __name__ == "__main__":
     main()
