@@ -3,6 +3,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from langchain.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.messages import HumanMessage
 
 @tool
 def get_current_time() -> str:
@@ -24,20 +25,25 @@ def main():
             print("에이전트: 다음에 또 만나요!")
             break
 
+        messages = [HumanMessage(content=user_message)]
         response = model_with_tools.invoke(user_message)
         
         if response.tool_calls:
+            # 모델이 만든 도구 호출 요청을 대화에 추가
+            messages.append(response)
+            
             for tool_call in response.tool_calls:
                 print(f"[도구 호출: {tool_call['name']}]")
-                tool_result = get_current_time.invoke(tool_call)
-                print(f"[도구 결과: {tool_result}]")
                 
-            # 도구 결과를 바탕으로 Gemini가 답변을 작성
-            final_response = model.invoke(
-                f"사용자 요청: {user_message}\n"
-                f"도구 결과: {tool_result}\n"
-                "도구 결과를 바탕으로 한국어로 답변해줘."
-            )
+                # 요청된 도구를 실제로 실행하고 결과 메시지를 대화에 추가
+                tool_result = get_current_time.invoke(tool_call)
+                messages.append(tool_result)
+                
+                
+                print(f"[도구 결과: {tool_result.content}]")
+                
+            # 원래 대화와 도구 결과를 모두 모델에 저장
+            final_response = model_with_tools.invoke(messages)
             print(f"에이전트: {final_response.content}")
         else:
             print(f"에이전트: {response.content}")
