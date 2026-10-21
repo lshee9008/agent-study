@@ -35,8 +35,19 @@ def load_history() -> list[dict[str, str]]:
     if not HISTORY_FILE.exists():
         return []
 
-    with HISTORY_FILE.open("r", encoding="utf-8") as file:
-        return json.load(file)
+    try:
+        with HISTORY_FILE.open("r", encoding="utf-8") as file:
+            return json.load(file)
+        
+        if not isinstance(history, list):
+            print("대화 기록 파일 형식이 올바르지 않아 새 기록으로 시작합니다.")
+            return []
+        
+        return history
+
+    except (json.JSONDecodeError, OSError) as error:
+        print(f"대화 기록을 읽지 못해 새 기록으로 시작합니다: {error}")
+        return []
 
 
 def save_history(history: list[dict[str, str]]) -> None:
