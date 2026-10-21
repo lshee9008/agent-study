@@ -1,0 +1,11 @@
+# API 키와 로컬 환경 변수
+.env
+.env.*
+
+# Python 가상환경 및 캐시
+.venv/
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store

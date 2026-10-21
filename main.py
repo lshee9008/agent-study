@@ -1,7 +1,8 @@
 import json
 from datetime import datetime
 from pathlib import Path
-
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 HISTORY_FILE = Path("conversation.json")
 
@@ -97,56 +98,24 @@ def run_agent(user_message: str) -> str:
 
 
 def main():
-    conversation_history = load_history()
-    print(f"이전 대화 {len(conversation_history)}개를 불러왔어요.")
-    print("에이전트 시작! 종료하려면 '종료'를 입력하세요.")
-
+    load_dotenv()
+    
+    model = ChatGoogleGenerativeAI(
+        model="gemini-3.7-flash",
+        temperature=0.2,
+    )
+    
+    print("Gemini 에이전트 시작! 종료하려면 '종료'를 입력하세요.")
+    
     while True:
         user_message = input("나: ").strip()
-
+        
         if user_message.lower() in {"exit", "종료"}:
             print("에이전트: 다음에 또 만나요!")
             break
-        
-        if user_message == "/history":
-            if not conversation_history:
-                print("저장된 대화가 없습니다.")
-            else:
-                print("\n최근 대화:")
-                for turn in conversation_history[-5:]:
-                    timestamp = turn.get("timestamp", "시각 정보 없음")
-                    print(f"[{timestamp}] 나: {turn['user']}")
-                    print(f"에이전트: {turn['assistant']}")
-            continue
-        
-        if user_message == "/clear":
-            confirmation = input(
-                "대화 기록 전체를 삭제할까요? 삭제하려면 '삭제'를 입력하세요: "
-            ).strip()
-            
-            if confirmation == "삭제":
-                conversation_history.clear()
-                save_history(conversation_history)
-                print("대화 기록을 삭제했습니다.")
-            else:
-                print("취소했습니다.")
-                
-            continue
-            
-            
 
-        answer = run_agent(user_message)
-
-        conversation_history.append({
-            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "user": user_message,
-            "assistant": answer,
-        })
-
-        save_history(conversation_history)
-        print(f"에이전트: {answer}")
-
-    print(f"전체 대화 {len(conversation_history)}개를 {HISTORY_FILE}에 저장했어요.")
+        response = model.invoke(user_message)
+        print(f"에이전트: {response.content}")
 
 
 if __name__ == "__main__":
