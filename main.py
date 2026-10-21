@@ -19,11 +19,13 @@ def say_hello() -> str:
 TOOLS = [
     {
         "name": "time",
+        "description": "현재 날짜와 시간을 알려준다.",
         "keywords": ["시간"],
         "function": get_current_time,
     },
     {
         "name": "hello",
+        "description": "사용자에게 인사한다.",
         "keywords": ["안녕"],
         "function": say_hello,
     },
@@ -56,6 +58,15 @@ def save_history(history: list[dict[str, str]]) -> None:
         json.dump(history, file, ensure_ascii=False, indent=2)
 
 
+def list_tools() -> str:
+    """등록된 도구 이름과 설명을 보여준다."""
+    lines = ["사용 가능한 도구."]
+    
+    for tool in TOOLS:
+        lines.append(f"- {tool['name']}: {tool['description']}")
+        
+    return "\n".join(lines)
+
 def find_tool(user_message: str) -> dict | None:
     """사용자 메시지에 맞는 도구를 찾는다."""
     for tool in TOOLS:
@@ -65,6 +76,9 @@ def find_tool(user_message: str) -> dict | None:
     return None
 
 def run_agent(user_message: str) -> str:
+    if "도움말" in user_message:
+        return list_tools()
+    
     tool = find_tool(user_message)
     
     if tool is None:
@@ -72,6 +86,7 @@ def run_agent(user_message: str) -> str:
     
     try:
         result = tool["function"]()
+        
     except Exception as error:
         return f"[{tool['name']} 도구 오류] {error}"
     
