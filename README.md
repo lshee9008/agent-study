@@ -217,18 +217,66 @@ if response.tool_calls:
 매 입력마다 새 메시지 목록을 만들면 이전 대화가 모델에 전달되지 않습니다. `messages`를 입력 반복문 바깥에서 한 번 만들고, 사용자 메시지와 모델 응답을 계속 추가하면 같은 실행 중 문맥을 이어갈 수 있습니다.
 
 ```python
-messages = []
+messages = []  # 반복문 바깥에서 한 번만 만든다
 
 while True:
     user_message = input("나: ").strip()
     messages.append(HumanMessage(content=user_message))
 
     response = model_with_tools.invoke(messages)
-    # 일반 답변이면 응답도 기록
+    # 일반 답변이면 AI 응답도 기록
     messages.append(response)
 ```
 
-도구를 호출한 경우에는 모델의 도구 호출 응답과 도구 결과를 모두 추가한 뒤 다시 모델을 호출합니다. 이렇게 유지되는 메시지는 현재 프로그램 실행 중의 메모리이며, 종료 후에도 유지하려면 별도의 파일 또는 데이터베이스 저장이 필요합니다.
+도구를 호출한 경우에는 모델의 도구 호출 응답과 도구 결과를 모두 추가한 뒤 다시 모델을 호출하고, 최종 AI 응답도 `messages`에 추가합니다. 이렇게 유지되는 메시지는 현재 프로그램 실행 중의 메모리이며, 종료 후에도 유지하려면 별도의 파일 또는 데이터베이스 저장이 필요합니다.
+
+## 9. 도구 이름으로 함수를 찾아 실행
+
+처음에는 도구 호출이 발생하면 시간 도구를 직접 실행했습니다. 도구가 여럿이면 모델이 요청한 도구 이름에 맞는 함수를 찾아야 하므로, 도구 이름을 키로 사용하는 딕셔너리를 만들었습니다.
+
+```python
+tools_by_name = {
+    get_current_time.name: get_current_time,
+}
+
+for tool_call in response.tool_calls:
+    tool_name = tool_call["name"]
+    selected_tool = tools_by_name.get(tool_name)
+
+    if selected_tool is None:
+        print(f"등록되지 않은 도구 요청: {tool_name}")
+        continue
+
+    tool_result = selected_tool.invoke(tool_call)
+    messages.append(tool_result)
+```
+
+`dict.get()`은 키가 없을 때 예외 대신 `None`을 돌려줍니다. 따라서 등록되지 않은 도구 요청을 확인하고 안전하게 건너뛸 수 있습니다. 도구를 추가할 때는 `model.bind_tools([...])`와 `tools_by_name` 양쪽에 등록해야 합니다.
+
+## 10. Gemini 응답에서 텍스트만 출력
+
+Gemini 연동 결과의 `response.content`는 항상 단순한 문자열인 것은 아닙니다. 텍스트와 서명 같은 메타데이터가 들어 있는 콘텐츠 블록 목록으로 반환될 수 있습니다. 전체 객체를 출력하면 텍스트 외 정보까지 터미널에 나타납니다.
+
+```python
+def get_text(content) -> str:
+    """모델 응답 콘텐츠에서 텍스트 블록만 추출한다."""
+    if isinstance(content, str):
+        return content
+
+    return "".join(
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+```
+
+응답 출력 때는 `response.content` 대신 다음처럼 사용합니다.
+
+```python
+print(f"에이전트: {get_text(response.content)}")
+```
+
+문자열 응답이면 그대로 반환하고, 콘텐츠 블록 목록이면 `type`이 `text`인 블록의 `text`만 이어 붙입니다. 이 실습에서는 일반 응답과 도구 실행 후 최종 응답 양쪽에 적용했습니다.
 
 ## 지금까지의 구조 변화
 
@@ -240,6 +288,8 @@ while True:
   → Gemini의 도구 선택과 실제 함수 실행
   → 도구 결과를 메시지로 연결
   → 실행 중 대화 문맥 유지
+  → 도구 이름으로 실행 함수 탐색
+  → 응답 콘텐츠에서 텍스트만 출력
 ```
 
 ## 기록해둔 주요 Git 커밋 메시지
@@ -257,3 +307,5 @@ while True:
 - `feat: Gemini 도구 호출로 현재 시간 응답`
 - `refactor: 도구 실행 결과를 LangChain 메시지 흐름에 연결`
 - `feat: 대화 메시지 히스토리로 문맥 유지`
+- `refactor: 도구 호출 이름에 따라 실행 함수 선택`
+- `feat: Gemini 응답에서 텍스트만 출력`
