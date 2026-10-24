@@ -11,6 +11,11 @@ def get_current_time() -> str:
     """사용자가 현재 날짜나 시간을 물으면 현재 날짜와 시간을 알려준다."""
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
+@tool
+def say_hello() -> str:
+    """사용자가 인사하면 친근하게 인사로 답한다."""
+    return "안녕하세요! 어떤 걸 도와드릴까요?"
+
 def get_text(content) -> str:
     """모델 응답에서 텍스트만 꺼낸다."""
     if isinstance(content, str):
@@ -26,7 +31,10 @@ def main():
     load_dotenv()
 
     model = ChatGoogleGenerativeAI(model="gemini-3.7-flash")
-    model_with_tools = model.bind_tools([get_current_time])
+    model_with_tools = model.bind_tools([
+        get_current_time,
+        say_hello
+        ])
 
     # 실행 중 대화 문맥을 유지할 메시지 목록
     messages = []
@@ -34,6 +42,7 @@ def main():
     # 도구 이름으로 실제 도구를 찾기 위한 딕셔너리
     tools_by_name = {
         get_current_time.name: get_current_time,
+        say_hello.name: say_hello,
     }
 
     print("Gemini 에이전트 시작! 종료하려면 '종료'를 입력하세요.")
