@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -48,15 +49,32 @@ def keep_recent_turns(messages, max_turns: int = MAX_HISTORY_TURNS):
     if len(human_indices) <= max_turns:
         return messages
 
-    # 최근 max_turns개의 사용자 입력부터 메시지를 보존한다.
+    # 최근 max_turns개의 사용자 입력부터 이후 메시지를 보존한다.
     start_index = human_indices[-max_turns]
     return messages[start_index:]
+
+
+def invoke_model_safely(model, messages):
+    """Gemini 호출 오류를 출력하고, 실패하면 None을 반환한다."""
+    try:
+        return model.invoke(messages)
+    except Exception as error:
+        print(f"[Gemini 호출 오류] {type(error).__name__}: {error}")
+        return None
 
 
 def main():
     load_dotenv()
 
-    model = ChatGoogleGenerativeAI(model="gemini-3.7-flash")
+    if not os.getenv("GOOGLE_API_KEY"):
+        print("GOOGLE_API_KEY를 찾을 수 없습니다. .env 파일을 확인해 주세요.")
+        return
+
+    try:
+        model = ChatGoogleGenerativeAI(model="gemini-3.7-flash")
+    except Exception as error:
+        print(f"[Gemini 초기화 오류] {type(error).__name__}: {error}")
+        return
 
     available_tools = [
         get_current_time,
@@ -83,14 +101,24 @@ def main():
             break
 
         messages.append(HumanMessage(content=user_message))
-        response = model_with_tools.invoke(messages)
+        response = invoke_model_safely(model_with_tools, messages)
+
+        if response is None:
+            failure_response = AIMessage(
+                content="Gemini 호출에 실패했습니다. 잠시 후 다시 시도해 주세요."
+            )
+            messages.append(failure_response)
+            print(f"에이전트: {failure_response.content}")
+            messages = keep_recent_turns(messages)
+            continue
+
         tool_rounds = 0
 
-        # 도구 요청이 남아 있고 최대 반복 횟수에 도달하지 않은 동안 실행한다.
+        # 모델이 도구를 더 요청하는 동안 반복한다.
         while response.tool_calls and tool_rounds < MAX_TOOL_ROUNDS:
             tool_rounds += 1
 
-            # 모델의 도구 요청 메시지를 대화 기록에 추가한다.
+            # 모델의 도구 호출 요청을 대화 기록에 추가한다.
             messages.append(response)
 
             for tool_call in response.tool_calls:
@@ -109,7 +137,7 @@ def main():
                     try:
                         tool_result = selected_tool.invoke(tool_call)
                     except Exception as error:
-                        print(f"[도구 오류: {tool_name}] {error}")
+                        print(f"[도구 오류: {tool_name}] {type(error).__name__}: {error}")
                         tool_result = ToolMessage(
                             content=f"도구 실행 중 오류가 발생했습니다: {error}",
                             tool_call_id=tool_call["id"],
@@ -118,20 +146,27 @@ def main():
                 messages.append(tool_result)
                 print(f"[도구 결과: {get_text(tool_result.content)}]")
 
-            # 결과를 받은 Gemini가 최종 답변을 만들거나 다음 도구를 요청한다.
-            response = model_with_tools.invoke(messages)
+            # 도구 결과를 보고 Gemini가 최종 답변 또는 다음 도구 요청을 만든다.
+            next_response = invoke_model_safely(model_with_tools, messages)
+
+            if next_response is None:
+                response = AIMessage(
+                    content="Gemini 호출에 실패해 이번 요청을 중단했습니다."
+                )
+                break
+
+            response = next_response
 
         if response.tool_calls:
-            # 제한 횟수에 도달하면 미처리 도구 요청을 기록하지 않고 이번 턴을 마친다.
+            # 최대 도구 호출 라운드에 도달한 경우
             notice = "도구 호출 최대 횟수에 도달해 이번 요청을 중단했습니다."
-            print(f"에이전트: {notice}")
-            messages.append(AIMessage(content=notice))
-        else:
-            messages.append(response)
-            print(f"에이전트: {get_text(response.content)}")
+            response = AIMessage(content=notice)
 
-        # 대화가 길어지면 완료된 최근 대화만 남긴다.
-        messages = keep_recent_turns(messages, max_turns=MAX_HISTORY_TURNS)
+        messages.append(response)
+        print(f"에이전트: {get_text(response.content)}")
+
+        # 완료된 최근 대화만 다음 요청의 문맥으로 보존한다.
+        messages = keep_recent_turns(messages)
 
 
 if __name__ == "__main__":
