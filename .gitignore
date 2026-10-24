@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 .env
 hermes-data/*
 !hermes-data/.gitkeep
@@ -5,3 +6,16 @@ workspace/drafts/*.md
 logs/*
 !logs/.gitkeep
 workspace/.last_success*
+=======
+# API 키와 로컬 환경 변수
+.env
+.env.*
+
+# Python 가상환경 및 캐시
+.venv/
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+>>>>>>> 05c308eb88c78b30daffc17c105956f9f51b27cf

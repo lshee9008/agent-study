@@ -1,0 +1,13 @@
+[project]
+name = "agent-study"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10.12"
+dependencies = [
+    "langchain>=1.4.6",
+    "langchain-google-genai>=4.4.2",
+    "langgraph>=1.2.16",
+    "langgraph-checkpoint-sqlite>=3.1.2",
+    "python-dotenv>=1.2.4",
+]
