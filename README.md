@@ -515,3 +515,117 @@ result = agent.invoke(
 - `threads.json`은 대화 목록과 현재 선택을, `agent_memory.sqlite`는 각 대화의 메시지 상태를 저장합니다.
 
 같은 ID로 그래프를 호출해야 같은 상태가 복원됩니다. 체크포인터는 메시지 상태를 저장하고, JSON 인덱스는 앱이 대화 목록과 현재 선택을 기억하게 합니다. 두 파일은 로컬 대화 정보를 담으므로 Git에서 제외합니다.
+
+## 17. LangGraph Store로 대화 간 장기 기억 저장
+
+체크포인터는 대화 스레드별 메시지와 실행 상태를 보존합니다. 사용자 이름, 선호도, 대화에서 기억해 달라고 한 사실처럼 여러 스레드에서 다시 쓸 정보는 `Store`에 저장합니다. 이 프로젝트에서는 SQLite 기반 `SqliteStore`를 사용합니다.
+
+```python
+from langgraph.store.sqlite import SqliteStore
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
+
+with SqliteStore.from_conn_string(
+    "agent_profile.sqlite",
+    index={"embed": embeddings, "dims": 3072, "fields": ["text"]},
+) as store:
+    store.setup()
+    store.put(
+        ("local-user", "memories"),
+        "memory-id",
+        {"text": "사용자는 간결한 설명을 선호한다."},
+        index=["text"],
+    )
+```
+
+- **namespace** `(사용자 ID, 분류)`는 저장 항목을 사용자별·종류별로 나눕니다.
+- **key**는 한 항목을 식별합니다. 이 프로젝트는 기억에 UUID를 사용합니다.
+- **value**는 저장할 데이터입니다. 기억은 `{"text": ...}` 형태로 보관합니다.
+- `index=["text"]`는 해당 텍스트를 임베딩 검색 인덱스에 포함합니다.
+- `store.search(..., query=질문)`은 문장에 같은 단어가 없어도 의미가 가까운 항목을 찾습니다.
+- Store를 사용하려면 `store.setup()`으로 SQLite 구조를 준비하고, 그래프를 `builder.compile(store=store)`로 컴파일합니다.
+
+현재 코드의 `call_model` 노드는 가장 최근 사용자 질문으로 관련 기억을 최대 3개 검색합니다. 검색한 정보는 시스템 메시지에 참고 정보로 넣어 모델이 답변에 활용하게 합니다. 장기 기억은 `agent_profile.sqlite`, 대화별 체크포인트는 `agent_memory.sqlite`에 있으므로 역할이 다릅니다.
+
+기존 기억을 나중에 임베딩 검색 대상으로 바꾼 경우를 위해 `reindex_existing_memories()`가 최초 한 번 기존 항목을 인덱싱합니다. 완료 여부는 Store의 설정 namespace에 표시하여 매 실행마다 같은 데이터를 다시 색인하지 않도록 합니다.
+
+## 18. 장기 기억의 CRUD
+
+CRUD는 데이터의 **생성(Create), 조회(Read), 수정(Update), 삭제(Delete)**를 뜻합니다. 현재 CLI에서 다음 명령으로 기억을 직접 관리합니다.
+
+```text
+/remember-fact 내용       기억 추가
+/memories                 저장된 기억 목록 보기
+/update-fact ID 새 내용   기억 수정
+/forget ID                기억 삭제
+```
+
+각 명령은 Store API로 이어집니다.
+
+```python
+# 생성 또는 같은 key의 값 갱신
+store.put(namespace, memory_id, {"text": text}, index=["text"])
+
+# 조회
+item = store.get(namespace, memory_id)
+
+# 의미 검색
+items = store.search(namespace, query="사용자의 선호", limit=3)
+
+# 삭제
+store.delete(namespace, memory_id)
+```
+
+`/update-fact`는 기존 ID를 유지하면서 내용을 바꿉니다. 수정한 텍스트도 임베딩 대상에 포함하므로 이후 의미 검색에 반영됩니다. 직접 명령은 사용자가 명시적으로 요청했기 때문에 바로 저장하고, 자연어 대화에서 모델이 제안하는 저장에는 다음 단계의 승인 절차를 적용합니다.
+
+## 19. Human-in-the-Loop로 기억 저장 승인
+
+모델이 도구를 호출한다고 해서 부작용이 있는 작업을 곧바로 실행하게 두면 안 됩니다. LangGraph의 `interrupt()`는 그래프 실행을 일시 중지하고 사용자 결정을 기다리게 합니다. 이 프로젝트는 기억 저장 도구 안에서 저장할 문장을 보여주고 승인 또는 거절을 받습니다. [공식 Interrupt 문서](https://docs.langchain.com/oss/python/langgraph/interrupts)
+
+```python
+decision = interrupt({
+    "action": "save_memory",
+    "text": text,
+    "message": "이 내용을 장기 기억에 저장할까요?",
+})
+
+if decision.get("action") != "approve":
+    return "사용자가 기억 저장을 취소했습니다."
+
+store.put(namespace, memory_id, {"text": decision["text"]}, index=["text"])
+```
+
+- `interrupt(payload)`는 실행을 중단하고 사용자 인터페이스로 전달할 데이터를 반환합니다.
+- 호출 코드는 입력을 받아 `Command(resume=...)`로 같은 그래프 실행을 재개합니다.
+- 승인하면 사용자가 내용을 편집한 뒤 저장할 수도 있습니다. 거절하면 저장하지 않습니다.
+- 중단된 실행을 이어가려면 같은 체크포인터와 같은 `thread_id`를 사용해야 합니다.
+- `ToolNode`가 도구를 실행하며, `interrupt()`가 발생하면 그래프가 대기 상태가 됩니다. 프로그램은 `result["__interrupt__"]`를 확인해 승인 여부를 입력받고 `Command(resume=...)`로 재호출합니다.
+
+따라서 현재 에이전트의 흐름은 다음과 같습니다.
+
+```text
+사용자 입력
+  → LangGraph agent 노드
+  → 관련 장기 기억 검색 및 모델 호출
+  → 도구 호출이 있으면 ToolNode
+  → 기억 저장 도구라면 interrupt로 승인 대기
+  → 사용자 승인 또는 거절
+  → Command(resume=...)로 그래프 재개
+  → 도구 결과를 모델에 전달
+  → 최종 답변
+```
+
+체크포인터의 **thread 상태**와 Store의 **사용자 장기 데이터**를 분리하고, 장기 기억의 쓰기 작업에 승인 단계를 두는 것이 현재 구현의 핵심입니다.
+
+## 현재 구현된 구성 요약
+
+| 구성 | 구현 | 파일 또는 명령 |
+| --- | --- | --- |
+| 대화별 상태 이어가기 | SQLite 체크포인터 + `thread_id` | `agent_memory.sqlite`, `/new`, `/use` |
+| 사용자 장기 프로필·기억 | LangGraph SQLite Store | `agent_profile.sqlite`, `/profile`, `/memories` |
+| 기억의 의미 검색 | Gemini 임베딩 인덱스 | `gemini-embedding-001` |
+| 기억 직접 관리 | 생성·조회·수정·삭제 | `/remember-fact`, `/memories`, `/update-fact`, `/forget` |
+| 자연어 기억 저장 제안 | 도구 호출 + `interrupt()` 승인 | `save_memory` 도구 |
+
+로컬 데이터베이스와 대화 인덱스에는 개인 정보가 들어갈 수 있으므로 `.gitignore`에서 `*.sqlite`, `*.db`, `threads.json`, `conversation.json`이 제외되는지 확인합니다. API 키는 `.env`에 보관하고 Git에 커밋하지 않습니다.
