@@ -629,3 +629,85 @@ store.put(namespace, memory_id, {"text": decision["text"]}, index=["text"])
 | 자연어 기억 저장 제안 | 도구 호출 + `interrupt()` 승인 | `save_memory` 도구 |
 
 로컬 데이터베이스와 대화 인덱스에는 개인 정보가 들어갈 수 있으므로 `.gitignore`에서 `*.sqlite`, `*.db`, `threads.json`, `conversation.json`이 제외되는지 확인합니다. API 키는 `.env`에 보관하고 Git에 커밋하지 않습니다.
+
+## 20. Supervisor와 전문 에이전트로 역할 나누기
+
+도구가 몇 개 없는 동안은 한 에이전트가 도구를 직접 선택해도 충분합니다. 기능과 업무 영역이 늘면 중심 에이전트는 사용자의 요청을 조정하고, 전문 에이전트는 특정 역할에 필요한 도구만 갖도록 나눌 수 있습니다. 이 구조를 Supervisor와 Subagent 패턴으로 구성합니다. [LangChain 공식 Subagents 문서](https://docs.langchain.com/oss/python/langchain/multi-agent/subagents)
+
+```text
+사용자
+  → Supervisor
+      ├─ 시간 질문 → 시간 전문가 → 현재 시간 도구
+      ├─ 기억 질문 → 기억 전문가 → Store 검색 도구
+      └─ 일반 질문 → Supervisor가 직접 답변
+```
+
+- **Supervisor**는 대화 흐름을 유지하고, 요청을 전문가에게 맡길지 직접 답할지 결정합니다.
+- **Subagent**는 한 분야에 맞춘 시스템 지침과 제한된 도구를 받습니다.
+- Subagent를 도구 함수로 감싸면 Supervisor가 다른 도구처럼 호출할 수 있습니다.
+- 전문 에이전트의 결과는 Supervisor에게 돌아오며, Supervisor가 사용자용 최종 답변을 구성합니다.
+- Subagent는 기본적으로 호출마다 독립된 문맥을 사용하고, Supervisor가 주 대화 문맥을 유지합니다.
+
+현재 시간 전문가와 기억 전문가는 다음처럼 만들 수 있습니다.
+
+```python
+from langchain.agents import create_agent
+
+time_expert = create_agent(
+    model=model,
+    tools=[get_current_time],
+    system_prompt="현재 시간 질문을 처리하는 전문가야. 시간 도구를 사용해.",
+)
+
+memory_expert = create_agent(
+    model=model,
+    tools=[memory_search_tool],
+    system_prompt="사용자 장기 기억을 검색하고 결과만 근거로 답해.",
+)
+```
+
+전문 에이전트를 Supervisor 도구로 감싸 호출합니다.
+
+```python
+@tool
+def ask_time_expert(question: str) -> str:
+    """현재 날짜나 시간에 관한 질문을 시간 전문가에게 맡긴다."""
+    result = time_expert.invoke(
+        {"messages": [HumanMessage(content=question)]}
+    )
+    return get_text(result["messages"][-1].content)
+```
+
+Supervisor는 전문 도구를 보고 요청을 위임합니다.
+
+```python
+supervisor = create_agent(
+    model=model,
+    tools=[ask_time_expert, ask_memory_expert, save_memory_tool],
+    system_prompt=(
+        "시간 질문은 시간 전문가에게 맡기고, "
+        "사용자 기억 질문은 기억 전문가에게 맡겨. "
+        "간단한 인사는 직접 답해."
+    ),
+    checkpointer=checkpointer,
+)
+```
+
+`create_agent`는 LangGraph 실행 흐름을 구성하는 고수준 API입니다. 기존 `StateGraph`를 직접 만들던 부분을 Supervisor 에이전트로 바꾸더라도, `checkpointer`와 `thread_id`를 전달하면 중심 에이전트의 대화 상태를 이어갈 수 있습니다. [LangChain Agents 문서](https://docs.langchain.com/oss/python/langchain/agents)
+
+### Router와 Supervisor의 차이
+
+| 패턴 | 동작 |
+| --- | --- |
+| Router | 한 번 분류해 요청을 알맞은 경로로 보냅니다. |
+| Supervisor | 대화 문맥을 유지하며 하나 이상의 전문가를 부르고 결과를 종합합니다. |
+
+전문 에이전트 호출은 모델 호출을 추가하므로 응답 시간과 API 비용이 늘 수 있습니다. 역할이 분명하고 도구와 지침을 나눌 이유가 있을 때 멀티 에이전트를 사용합니다. 도구가 적고 업무가 단순하면 단일 에이전트가 더 간결합니다.
+
+### Subagent와 Subgraph의 차이
+
+- **Subagent 패턴**은 Supervisor가 전문 에이전트를 도구처럼 호출합니다.
+- **Subgraph**는 하나의 LangGraph 그래프를 다른 그래프의 노드로 연결합니다.
+- 부모와 자식 그래프가 상태를 공유하는지, 별도 상태 스키마를 쓰는지에 따라 직접 연결하거나 입력과 출력을 변환하는 노드를 둘 수 있습니다.
+
+LangGraph 문서는 Subgraph를 멀티 에이전트, 그래프 재사용, 하위 흐름의 독립 개발에 사용할 수 있다고 설명합니다. [LangGraph Subgraphs 문서](https://docs.langchain.com/oss/python/langgraph/use-subgraphs)
