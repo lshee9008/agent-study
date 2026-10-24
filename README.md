@@ -143,6 +143,9 @@ GOOGLE_API_KEY=실제_Gemini_API_키
 .venv/
 __pycache__/
 *.py[cod]
+*.sqlite
+*.db
+threads.json
 .DS_Store
 ```
 
@@ -447,3 +450,68 @@ messages = result["messages"]
 - `feat: 도구 호출 제한과 최근 대화 히스토리 관리 추가`
 - `fix: Gemini 모델 호출 오류 처리 추가`
 - `feat: LangGraph로 Gemini 도구 에이전트 구성`
+- `feat: SQLite 체크포인터로 대화 상태 저장`
+
+## 15. SQLite 체크포인터로 실행 후에도 대화 이어가기
+
+앞선 LangGraph 실습에서는 `messages` 리스트가 프로그램 실행 중에만 남았습니다. 그래프를 체크포인터와 함께 컴파일하면 LangGraph가 그래프 상태를 `thread_id`별 체크포인트로 저장하고, 다음 실행에서 불러올 수 있습니다. 체크포인트는 대화 스레드의 단기 문맥과 실행 상태를 복원하는 용도입니다. 사용자 선호도처럼 여러 대화 스레드에 걸쳐 공유할 장기 정보는 별도의 Store 개념으로 다룹니다. [공식 Persistence 문서](https://docs.langchain.com/oss/python/langgraph/persistence)
+
+SQLite 체크포인터 패키지를 추가합니다.
+
+```bash
+uv add langgraph-checkpoint-sqlite
+```
+
+```python
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+with SqliteSaver.from_conn_string("agent_memory.sqlite") as checkpointer:
+    agent = builder.compile(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": "agent-study-default"}}
+
+    result = agent.invoke(
+        {"messages": [HumanMessage(content=user_message)]},
+        config=config,
+    )
+```
+
+- `SqliteSaver`는 그래프 상태를 로컬 SQLite 파일에 저장합니다.
+- `thread_id`는 어떤 대화의 상태를 불러오고 저장할지 식별합니다. 같은 ID로 다시 실행하면 해당 대화가 이어집니다. 다른 ID를 사용하면 별도의 대화 스레드가 됩니다.
+- 체크포인터를 쓰면 매번 전체 `messages` 목록을 직접 전달하거나 자체 JSON 히스토리를 관리할 필요가 줄어듭니다. 새 사용자 메시지만 입력하고 체크포인터가 이전 상태를 복원합니다.
+- SQLite 파일에는 사용자 대화가 들어갈 수 있으므로 `.gitignore`에 `*.sqlite`와 `*.db`를 추가해 로컬 기록이 Git에 올라가지 않도록 합니다.
+- 로컬 SQLite는 학습과 개발에 적합합니다. 여러 서버에서 함께 쓰는 운영 환경에는 PostgreSQL 같은 영속 저장소를 고려합니다.
+
+체크포인터 저장은 대화 문맥을 프로그램 재시작 이후까지 이어주는 기능이며, 사용자 프로필 같은 장기 기억 저장소와는 구분됩니다. 체크포인터 개념과 `thread_id`는 [공식 Checkpointers 문서](https://docs.langchain.com/oss/python/langgraph/checkpointers), SQLite saver 사용법은 [공식 LangGraph SQLite 구현 문서](https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py)에 설명되어 있습니다.
+
+## 16. 여러 대화 스레드 만들기와 전환
+
+하나의 고정 `thread_id`만 사용하면 실행을 다시 시작해도 늘 같은 대화로 돌아갑니다. `thread_id`를 대화마다 다르게 지정하면 체크포인터가 각 대화 상태를 별도로 저장합니다. `/new`, `/threads`, `/use <ID>`, `/thread` 명령으로 대화를 만들고 전환할 수 있습니다.
+
+```python
+from uuid import uuid4
+
+active_thread_id = registry["active_thread_id"]
+
+if user_message == "/new":
+    active_thread_id = str(uuid4())
+    registry["threads"][active_thread_id] = f"대화 {len(registry['threads']) + 1}"
+    registry["active_thread_id"] = active_thread_id
+    save_registry(registry)
+
+config = {
+    "configurable": {"thread_id": active_thread_id},
+    "recursion_limit": 25,
+}
+result = agent.invoke(
+    {"messages": [HumanMessage(content=user_message)]},
+    config=config,
+)
+```
+
+- `/new`: UUID를 새 thread ID로 만들어 별도 대화를 시작합니다.
+- `/threads`: 로컬 인덱스에 등록된 대화 ID 목록을 보여줍니다.
+- `/use <ID>`: 기존 ID를 선택해 해당 대화를 재개합니다.
+- `/thread`: 현재 활성 대화 ID를 표시합니다.
+- `threads.json`은 대화 목록과 현재 선택을, `agent_memory.sqlite`는 각 대화의 메시지 상태를 저장합니다.
+
+같은 ID로 그래프를 호출해야 같은 상태가 복원됩니다. 체크포인터는 메시지 상태를 저장하고, JSON 인덱스는 앱이 대화 목록과 현재 선택을 기억하게 합니다. 두 파일은 로컬 대화 정보를 담으므로 Git에서 제외합니다.
