@@ -1,0 +1,7 @@
+.env
+hermes-data/*
+!hermes-data/.gitkeep
+workspace/drafts/*.md
+logs/*
+!logs/.gitkeep
+workspace/.last_success*

@@ -1,0 +1,31 @@
+# Hermes Agent (Docker) + NVIDIA API (오픈소스 모델)
+# 상시 실행하지 않습니다. scripts/run-if-due.sh 가 필요할 때만
+#   docker compose run --rm hermes chat ...
+# 으로 일회성 컨테이너를 띄우고, 끝나면 자동 삭제됩니다.
+# (대시보드를 보고 싶을 때만 수동으로 docker compose up -d)
+services:
+  hermes:
+    image: nousresearch/hermes-agent:stable
+    container_name: hermes-velog
+    command: gateway run
+    ports:
+      - "127.0.0.1:8642:8642"
+      - "127.0.0.1:9119:9119"
+    environment:
+      - HERMES_DASHBOARD=0      # 일회성 실행엔 대시보드 불필요
+      # 파일 쓰기 허용 범위: Hermes 데이터 + 초안 폴더만 (sources.yaml 은 수정 불가)
+      - HERMES_WRITE_SAFE_ROOT=/opt/data:/opt/workspace/drafts
+    volumes:
+      # Hermes 데이터(세션·메모리·게이트웨이 소켓)는 도커 볼륨에 둔다.
+      # 맥 폴더에 두면 소켓 권한이 0755 로 보여 Hermes 보안 검사에 걸림.
+      - hermes-home:/opt/data
+      # 설정·스킬만 맥 폴더에서 연결 (scripts/render-config.sh 가 생성)
+      - ./hermes-data/config.yaml:/opt/data/config.yaml
+      - ./hermes-data/.env:/opt/data/.env
+      - ./skills:/opt/skills:ro
+      - ./workspace:/opt/workspace
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  hermes-home:

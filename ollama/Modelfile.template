@@ -1,0 +1,4 @@
+FROM __BASE_MODEL__
+# Hermes는 시스템 프롬프트+툴 스키마 때문에 최소 64K 컨텍스트가 필요
+PARAMETER num_ctx 65536
+PARAMETER temperature 0.4

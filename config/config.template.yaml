@@ -1,0 +1,44 @@
+# scripts/render-config.sh 가 .env 값을 채워 hermes-data/config.yaml 로 렌더링합니다.
+# (렌더링된 파일엔 토큰이 들어가므로 커밋 금지 — .gitignore 처리됨)
+
+model:
+  default: "${NVIDIA_MODEL}"
+  provider: "nvidia"              # build.nvidia.com (키: hermes-data/.env 의 NVIDIA_API_KEY)
+  base_url: "https://integrate.api.nvidia.com/v1"
+
+# 보조 작업(대화 압축·제목 생성)도 같은 NVIDIA 모델로 처리
+# (기본값 auto 는 OpenRouter/Nous 를 먼저 찾으므로 명시)
+auxiliary:
+  compression:
+    provider: "main"
+  title_generation:
+    provider: "main"
+
+# 프로젝트 skills/ 폴더 (docker-compose 에서 /opt/skills 로 읽기 전용 연결)
+skills:
+  external_dirs:
+    - /opt/skills
+
+mcp_servers:
+  # GitHub 공식 원격 MCP (PAT 인증)
+  github:
+    url: "https://api.githubcopilot.com/mcp/"
+    headers:
+      Authorization: "Bearer ${GITHUB_PAT}"
+
+  # Notion 공식 MCP (stdio)
+  notion:
+    command: "npx"
+    args: ["-y", "@notionhq/notion-mcp-server"]
+    env:
+      NOTION_TOKEN: "${NOTION_TOKEN}"
+
+  # Velog 비공식 MCP (publish_local_markdown 지원)
+  velog:
+    command: "npx"
+    args: ["-y", "velog-mcp"]
+    env:
+      VELOG_ACCESS_TOKEN: "${VELOG_ACCESS_TOKEN}"
+      VELOG_REFRESH_TOKEN: "${VELOG_REFRESH_TOKEN}"
+    tools:
+      exclude: [delete_post]      # 에이전트가 글을 지우지 못하게
