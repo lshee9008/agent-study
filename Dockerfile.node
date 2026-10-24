@@ -1,7 +1,0 @@
-# [선택] 공식 이미지에 npx(Node)가 없을 때만 사용
-# docker-compose.yml 의 image: 줄을 build: { context: ., dockerfile: Dockerfile.node } 로 교체
-FROM nousresearch/hermes-agent:stable
-USER root
-RUN apt-get update \
- && apt-get install -y --no-install-recommends nodejs npm \
- && rm -rf /var/lib/apt/lists/*
