@@ -2,15 +2,16 @@ import os
 from datetime import datetime
 
 from dotenv import load_dotenv
-from langchain.messages import AIMessage, HumanMessage
+from langchain.messages import HumanMessage
 from langchain.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import MessagesState, StateGraph, START
 from langgraph.prebuilt import ToolNode, tools_condition
 
 
-MAX_HISTORY_TURNS = 5
 GRAPH_RECURSION_LIMIT = 25
+THREAD_ID = "agent-study-default"
 
 
 @tool
@@ -37,18 +38,22 @@ def get_text(content) -> str:
     )
 
 
-def keep_recent_turns(messages, max_turns: int = MAX_HISTORY_TURNS):
-    """최근 사용자 대화와 그에 딸린 메시지를 보존한다."""
-    human_indices = [
-        index
-        for index, message in enumerate(messages)
-        if isinstance(message, HumanMessage)
-    ]
+def build_graph(model, tools):
+    model_with_tools = model.bind_tools(tools)
 
-    if len(human_indices) <= max_turns:
-        return messages
+    def call_model(state: MessagesState):
+        response = model_with_tools.invoke(state["messages"])
+        return {"messages": [response]}
 
-    return messages[human_indices[-max_turns]:]
+    builder = StateGraph(MessagesState)
+    builder.add_node("agent", call_model)
+    builder.add_node("tools", ToolNode(tools))
+
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", tools_condition)
+    builder.add_edge("tools", "agent")
+
+    return builder.compile
 
 
 def main():
@@ -58,60 +63,46 @@ def main():
         print("GOOGLE_API_KEY를 찾을 수 없습니다. .env 파일을 확인해 주세요.")
         return
 
-    model = ChatGoogleGenerativeAI(model="gemini-3.7-flash")
+    try:
+        model = ChatGoogleGenerativeAI(model="gemini-3.7-flash")
+    except Exception as error:
+        print(f"[Gemini 초기화 오류] {type(error).__name__}: {error}")
+        return
 
     tools = [get_current_time, say_hello]
-    model_with_tools = model.bind_tools(tools)
 
-    # 노드 1: 현재 대화 상태를 Gemini에 보내 응답을 받는다.
-    def call_model(state: MessagesState):
-        response = model_with_tools.invoke(state["messages"])
-        return {"messages": [response]}
+    # SQLite 파일에 그래프 상태를 저장한다.
+    with SqliteSaver.from_conn_string("agent_memory.sqlite") as checkpointer:
+        graph_builder_compile = build_graph(model, tools)
+        agent = graph_builder_compile(checkpointer=checkpointer)
 
-    # 그래프를 만들고 모델/도구 노드를 등록한다.
-    builder = StateGraph(MessagesState)
-    builder.add_node("agent", call_model)
-    builder.add_node("tools", ToolNode(tools))
+        # 같은 thread_id를 사용하면 이전 대화 상태를 이어간다.
+        config = {
+            "configurable": {
+                "thread_id": THREAD_ID,
+            },
+            "recursion_limit": GRAPH_RECURSION_LIMIT,
+        }
 
-    # 시작하면 모델부터 실행한다.
-    builder.add_edge(START, "agent")
+        print("LangGraph 에이전트 시작! 종료하려면 '종료'를 입력하세요.")
 
-    # 모델이 도구를 요청하면 tools로, 일반 답변이면 그래프 종료로 이동한다.
-    builder.add_conditional_edges("agent", tools_condition)
+        while True:
+            user_message = input("나: ").strip()
 
-    # 도구 실행 후에는 다시 모델로 돌아가 결과를 해석한다.
-    builder.add_edge("tools", "agent")
+            if user_message.lower() in {"exit", "종료"}:
+                print("에이전트: 다음에 또 만나요!")
+                break
 
-    agent = builder.compile()
+            try:
+                result = agent.invoke(
+                    {"messages": [HumanMessage(content=user_message)]},
+                    config=config,
+                )
+                final_message = result["messages"][-1]
+                print(f"에이전트: {get_text(final_message.content)}")
 
-    messages = []
-
-    print("LangGraph Gemini 에이전트 시작! 종료하려면 '종료'를 입력하세요.")
-
-    while True:
-        user_message = input("나: ").strip()
-
-        if user_message.lower() in {"exit", "종료"}:
-            print("에이전트: 다음에 또 만나요!")
-            break
-
-        messages.append(HumanMessage(content=user_message))
-
-        try:
-            result = agent.invoke(
-                {"messages": messages},
-                config={"recursion_limit": GRAPH_RECURSION_LIMIT},
-            )
-            messages = result["messages"]
-            print(f"에이전트: {get_text(messages[-1].content)}")
-
-        except Exception as error:
-            print(f"[에이전트 실행 오류] {type(error).__name__}: {error}")
-            messages.append(
-                AIMessage(content="요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.")
-            )
-
-        messages = keep_recent_turns(messages)
+            except Exception as error:
+                print(f"[에이전트 실행 오류] {type(error).__name__}: {error}")
 
 
 if __name__ == "__main__":
