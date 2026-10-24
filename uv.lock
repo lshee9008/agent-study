@@ -15,6 +15,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "langchain" },
     { name = "langchain-google-genai" },
+    { name = "langgraph" },
     { name = "python-dotenv" },
 ]
 
@@ -22,6 +23,7 @@ dependencies = [
 requires-dist = [
     { name = "langchain", specifier = ">=1.4.6" },
     { name = "langchain-google-genai", specifier = ">=4.4.2" },
+    { name = "langgraph", specifier = ">=1.2.16" },
     { name = "python-dotenv", specifier = ">=1.2.4" },
 ]
 
