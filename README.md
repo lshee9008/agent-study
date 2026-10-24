@@ -15,7 +15,7 @@ uv run main.py
 사용한 패키지:
 
 ```bash
-uv add langchain langchain-google-genai python-dotenv
+uv add langchain langchain-google-genai python-dotenv langgraph
 ```
 
 ## 1. 규칙 기반 응답에서 도구 실행으로
@@ -278,6 +278,135 @@ print(f"에이전트: {get_text(response.content)}")
 
 문자열 응답이면 그대로 반환하고, 콘텐츠 블록 목록이면 `type`이 `text`인 블록의 `text`만 이어 붙입니다. 이 실습에서는 일반 응답과 도구 실행 후 최종 응답 양쪽에 적용했습니다.
 
+## 11. 도구를 여러 번 부르는 루프와 제한
+
+Gemini가 도구를 요청하고, 도구 결과를 받은 뒤 다시 다른 도구를 요청할 수 있습니다. 이때 `while response.tool_calls`로 도구 요청이 끝날 때까지 반복했습니다.
+
+```python
+tool_rounds = 0
+
+while response.tool_calls and tool_rounds < MAX_TOOL_ROUNDS:
+    tool_rounds += 1
+    messages.append(response)
+
+    for tool_call in response.tool_calls:
+        selected_tool = tools_by_name.get(tool_call["name"])
+        # 도구를 찾아 실행하고 ToolMessage를 messages에 추가
+
+    response = model_with_tools.invoke(messages)
+```
+
+`MAX_TOOL_ROUNDS`는 한 사용자 요청에서 모델과 도구가 왕복하는 최대 횟수입니다. 한 라운드에서 여러 도구가 병렬이 아닌 순차로 실행될 수 있으므로, 이것은 개별 도구 호출 개수와는 다른 제한입니다. 제한에 도달하면 이번 요청을 중단하고 안내 메시지를 남깁니다.
+
+## 12. 모델 호출과 도구 오류 처리
+
+도구 함수의 실패는 `try/except`로 잡고, 오류도 해당 도구 호출에 연결된 `ToolMessage`로 돌려줍니다. Gemini 호출 실패는 별도로 처리해 프로그램이 입력 루프를 계속할 수 있게 했습니다.
+
+```python
+try:
+    tool_result = selected_tool.invoke(tool_call)
+except Exception as error:
+    tool_result = ToolMessage(
+        content=f"도구 실행 중 오류가 발생했습니다: {error}",
+        tool_call_id=tool_call["id"],
+    )
+
+messages.append(tool_result)
+```
+
+모델 호출도 안전 호출 함수로 감쌌습니다.
+
+```python
+def invoke_model_safely(model, messages):
+    try:
+        return model.invoke(messages)
+    except Exception as error:
+        print(f"[Gemini 호출 오류] {type(error).__name__}: {error}")
+        return None
+```
+
+이렇게 하면 API 요청 오류가 발생했을 때 오류를 사용자에게 알리고 다음 입력을 받을 수 있습니다. 자동 재시도는 구현하지 않았습니다.
+
+## 13. 최근 대화 턴만 유지
+
+대화가 길어질수록 전체 메시지를 매번 모델에 보내는 비용과 문맥 크기가 커집니다. `HumanMessage`가 시작하는 턴을 기준으로 최근 대화만 남겼습니다.
+
+```python
+def keep_recent_turns(messages, max_turns=5):
+    human_indices = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, HumanMessage)
+    ]
+
+    if len(human_indices) <= max_turns:
+        return messages
+
+    return messages[human_indices[-max_turns]:]
+```
+
+사용자 메시지 뒤에 연결된 AI 도구 요청, 도구 결과, 최종 답변을 한 턴으로 보고 보존합니다. 목록의 끝에서 메시지 몇 개만 자르는 방식은 도구 요청과 결과를 분리할 수 있어 사용하지 않았습니다. 이 히스토리는 실행 중 메모리일 뿐, 프로그램을 종료하면 사라집니다.
+
+## 14. LangGraph로 에이전트 흐름 구성
+
+직접 작성한 `while response.tool_calls` 반복을 LangGraph의 그래프로 옮겼습니다. LangGraph 그래프는 공유 **상태(State)**, 작업을 수행하는 **노드(Node)**, 다음 노드를 정하는 **엣지(Edge)** 로 구성됩니다. `StateGraph`로 그래프를 만들고 `compile()`한 뒤 `invoke()`로 실행합니다. [공식 Graph API 문서](https://docs.langchain.com/oss/python/langgraph/graph-api)
+
+```bash
+uv add langgraph
+```
+
+그래프 상태로는 LangGraph가 제공하는 `MessagesState`를 사용합니다. 이 상태에는 메시지 목록이 있으며, 노드가 반환하는 새 메시지가 목록에 누적됩니다.
+
+```python
+from langgraph.graph import MessagesState, StateGraph, START
+from langgraph.prebuilt import ToolNode, tools_condition
+
+
+def call_model(state: MessagesState):
+    response = model_with_tools.invoke(state["messages"])
+    return {"messages": [response]}
+```
+
+`call_model`은 모델 노드입니다. 도구 실행을 포함한 전체 흐름을 그래프로 연결합니다.
+
+```python
+builder = StateGraph(MessagesState)
+builder.add_node("agent", call_model)
+builder.add_node("tools", ToolNode(tools))
+
+builder.add_edge(START, "agent")
+builder.add_conditional_edges("agent", tools_condition)
+builder.add_edge("tools", "agent")
+
+agent = builder.compile()
+```
+
+- `START → agent`: 사용자 입력을 받아 모델 노드부터 실행합니다.
+- `tools_condition`: 모델 응답에 `tool_calls`가 있으면 `tools` 노드로 보내고, 없으면 실행을 끝냅니다.
+- `tools → agent`: 도구 실행 결과를 다시 모델에 전달합니다. 모델이 최종 답변을 만들거나 추가 도구를 요청할 수 있습니다.
+- `compile()`: 그래프 구성을 점검하고 실행 가능한 그래프로 만듭니다.
+- `agent.invoke(...)`: 그래프 실행을 시작합니다.
+
+```python
+result = agent.invoke(
+    {"messages": messages},
+    config={"recursion_limit": 25},
+)
+messages = result["messages"]
+```
+
+`recursion_limit`은 반복되는 그래프 실행 단계를 제한합니다. 이전의 `MAX_TOOL_ROUNDS`와 비슷한 안전장치지만, 도구 왕복 횟수와 그래프 단계 수는 정확히 같은 개념이 아닙니다. 그래프 구성과 조건 분기 흐름은 [공식 LangGraph Quickstart](https://docs.langchain.com/oss/python/langgraph/quickstart)를 참고했습니다.
+
+### 직접 작성한 루프와 LangGraph 비교
+
+| 직접 작성한 에이전트 | LangGraph 방식 |
+| --- | --- |
+| `messages` 리스트 | `MessagesState` |
+| `model.invoke(...)` | 모델 노드 `call_model` |
+| Python 도구 실행 `for`문 | `ToolNode` |
+| `while response.tool_calls` | 조건 엣지 `tools_condition`와 `tools → agent` 연결 |
+| 수동 호출 횟수 카운터 | 그래프 `recursion_limit` 설정 |
+
 ## 지금까지의 구조 변화
 
 ```text
@@ -290,6 +419,10 @@ print(f"에이전트: {get_text(response.content)}")
   → 실행 중 대화 문맥 유지
   → 도구 이름으로 실행 함수 탐색
   → 응답 콘텐츠에서 텍스트만 출력
+  → 다중 도구 호출 반복 및 제한
+  → 모델/API 및 도구 오류 처리
+  → 최근 대화 턴 유지
+  → LangGraph StateGraph로 흐름 표현
 ```
 
 ## 기록해둔 주요 Git 커밋 메시지
@@ -309,3 +442,8 @@ print(f"에이전트: {get_text(response.content)}")
 - `feat: 대화 메시지 히스토리로 문맥 유지`
 - `refactor: 도구 호출 이름에 따라 실행 함수 선택`
 - `feat: Gemini 응답에서 텍스트만 출력`
+- `feat: Gemini 도구 호출 반복 처리 추가`
+- `fix: 도구 실행 오류를 처리해 대화 유지`
+- `feat: 도구 호출 제한과 최근 대화 히스토리 관리 추가`
+- `fix: Gemini 모델 호출 오류 처리 추가`
+- `feat: LangGraph로 Gemini 도구 에이전트 구성`
