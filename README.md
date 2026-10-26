@@ -711,3 +711,123 @@ supervisor = create_agent(
 - 부모와 자식 그래프가 상태를 공유하는지, 별도 상태 스키마를 쓰는지에 따라 직접 연결하거나 입력과 출력을 변환하는 노드를 둘 수 있습니다.
 
 LangGraph 문서는 Subgraph를 멀티 에이전트, 그래프 재사용, 하위 흐름의 독립 개발에 사용할 수 있다고 설명합니다. [LangGraph Subgraphs 문서](https://docs.langchain.com/oss/python/langgraph/use-subgraphs)
+
+## 21. 구조화된 라우터와 조건부 전문가 경로
+
+Supervisor 패턴에서는 모델이 도구를 고르고 전문가를 호출합니다. 다음 단계에서는 요청을 먼저 정해진 형식으로 분류한 뒤, Python 코드가 LangGraph의 조건부 엣지를 통해 전문가 경로를 선택하도록 구성합니다.
+
+```text
+사용자 요청
+  → classify: 모델이 RouteDecision을 생성
+  → 조건부 분기
+      ├─ time       → 시간 전문가
+      ├─ memory     → 기억 검색 전문가
+      ├─ save_memory→ 승인 후 기억 저장
+      └─ chat       → 일반 대화
+  → 응답
+```
+
+분류 결과를 Pydantic 모델로 선언하면, 모델의 임의 텍스트를 코드에서 다시 해석하지 않고 `category`와 `query` 필드를 읽을 수 있습니다.
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field
+
+
+class RouteDecision(BaseModel):
+    category: Literal["time", "memory", "save_memory", "chat"]
+    query: str = Field(description="전문가에게 전달할 요청 또는 기억 내용")
+```
+
+LangChain 에이전트의 `response_format`에 스키마를 전달하면, 결과는 `structured_response`에서 가져옵니다.
+
+```python
+router = create_agent(
+    model=model,
+    tools=[],
+    response_format=RouteDecision,
+    system_prompt="사용자 요청을 지정된 카테고리 중 하나로 분류해.",
+)
+
+result = router.invoke({"messages": [HumanMessage(content=user_message)]})
+decision = result["structured_response"]
+```
+
+- `Literal`은 `category`에 허용되는 값을 제한합니다.
+- `Field`는 필드의 의미를 모델에 설명합니다.
+- 구조화된 출력은 분류 결과의 모양을 고정합니다. 올바른 경로를 고르는 기준과 시스템 프롬프트는 별도로 설계해야 합니다.
+- 이 방식은 모델이 경로를 분류하되, 실제 노드 선택은 애플리케이션의 코드가 수행하게 합니다. [LangChain 구조화된 출력 문서](https://docs.langchain.com/oss/python/langchain/structured-output)
+
+### LangGraph 조건부 분기
+
+StateGraph에는 분류 결과를 보관할 상태 필드와 라우터 노드를 둡니다. `add_conditional_edges()`는 상태를 읽는 라우팅 함수의 결과에 따라 다음 노드를 선택합니다.
+
+```python
+def route_request(state):
+    return state["decision"].category
+
+
+builder.add_node("classify", classify)
+builder.add_node("time_expert", run_time_expert)
+builder.add_node("memory_expert", run_memory_expert)
+builder.add_node("save_memory", save_memory_with_approval)
+builder.add_node("chat", answer_chat)
+
+builder.add_conditional_edges(
+    "classify",
+    route_request,
+    {
+        "time": "time_expert",
+        "memory": "memory_expert",
+        "save_memory": "save_memory",
+        "chat": "chat",
+    },
+)
+```
+
+이 구조에서는 라우터의 출력이 실행할 노드를 직접 결정하므로 경로를 코드에서 확인하기 쉽습니다. 각 전문가가 받는 지시와 도구도 해당 노드에서 제한할 수 있습니다. `save_memory` 경로에는 앞 단계에서 학습한 `interrupt()` 승인을 연결해, 쓰기 작업 전 사용자 결정을 받습니다.
+
+### Supervisor 패턴과 비교
+
+| 구조 | 경로 선택 | 장점 | 고려할 점 |
+| --- | --- | --- | --- |
+| Supervisor | 에이전트가 도구 호출로 전문가를 선택하고 결과를 종합 | 여러 전문가를 조합하는 유연한 대화 | 도구 호출 흐름과 종료 조건을 살펴야 함 |
+| 구조화 라우터 | 라우터가 분류하고 코드가 한 경로를 선택 | 경로가 명시적이고 분기 동작을 추적하기 쉬움 | 분류 모델 호출이 추가되고, 정해진 경로 밖의 조합은 별도 설계 필요 |
+
+라우터가 별도 모델 호출이면 그만큼 지연 시간과 API 사용량이 늘어납니다. 분류 결과에 따라 한 전문가만 실행하도록 단순화하면 불필요한 전문가 호출을 줄일 수 있지만, 여러 전문가의 결과를 합쳐야 하는 요청에는 Supervisor가 더 적합할 수 있습니다.
+
+### 그래프 이벤트 스트리밍
+
+일반적인 `invoke()`는 그래프 실행이 끝난 뒤 결과를 반환합니다. `stream()`을 사용하면 노드가 실행되는 동안 상태 업데이트를 받을 수 있어 진행 상황이나 토큰을 점진적으로 보여주는 UI를 만들 수 있습니다.
+
+```python
+for chunk in graph.stream(
+    input_state,
+    config={"configurable": {"thread_id": thread_id}},
+    stream_mode="updates",
+    version="v2",
+):
+    if chunk["type"] == "updates":
+        print(chunk["data"])
+```
+
+- `stream_mode="updates"`는 노드가 상태에 기록한 업데이트를 전달합니다.
+- `stream_mode="messages"`는 모델이 생성하는 메시지 청크와 메타데이터를 전달하므로 토큰 단위 출력을 구현할 때 사용할 수 있습니다.
+- 버전 2 스트림 청크는 `type`, `ns`, `data` 필드가 있는 통일된 형태입니다. 코드에서 `chunk["type"]`을 확인해 이벤트 종류를 구분합니다.
+- 토큰 스트리밍은 모델·통합 패키지·그래프 설정의 지원을 확인해야 합니다. [LangGraph 스트리밍 문서](https://docs.langchain.com/oss/python/langgraph/streaming)
+
+### 라우터 평가
+
+라우터는 정상 질문만으로 확인하지 말고, 경계가 애매하거나 기억을 저장하는 부작용이 있는 입력도 함께 점검합니다.
+
+| 입력 예시 | 기대 카테고리 | 확인 내용 |
+| --- | --- | --- |
+| “지금 몇 시야?” | `time` | 시간 도구 결과를 사용했는가 |
+| “내가 선호하는 언어가 뭐였지?” | `memory` | 검색된 기억을 근거로 답했는가 |
+| “나는 매운 음식을 좋아한다고 기억해줘” | `save_memory` | 승인 전에 Store에 저장하지 않았는가 |
+| “안녕!” | `chat` | 전문가 호출 없이 자연스럽게 답했는가 |
+| “내가 선호하는 언어를 기억해두고, 지금 시간을 알려줘” | 정책에 따른 분류 | 복합 요청 처리 정책이 일관적인가 |
+
+기록할 지표는 카테고리별 분류 정확도, 잘못된 전문가 경로 비율, 도구 성공률, 응답 지연 시간, 사용자 승인 없이 발생한 저장 건수입니다. 특히 복합 요청의 경우 한 경로만 허용할지, 여러 경로를 순서대로 실행할지 정책을 코드와 평가 사례에 명시해야 합니다.
+
+이번 단계에서 달라진 핵심은 요청 해석과 작업 실행을 나눈 점입니다. 모델은 정해진 스키마로 요청을 분류하고, LangGraph는 명시된 분기표대로 전문가를 실행합니다. 스트리밍으로 실행 중 업데이트를 관찰하고, 평가 사례로 라우팅과 부작용 통제를 확인할 수 있습니다.

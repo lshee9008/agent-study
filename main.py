@@ -1,125 +1,82 @@
 from datetime import datetime
 import json
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
 from langchain.agents import create_agent
-from langchain.messages import HumanMessage
+from langchain.messages import AIMessage, HumanMessage, SystemMessage
 from langchain.tools import tool
 from langchain_google_genai import (
     ChatGoogleGenerativeAI,
     GoogleGenerativeAIEmbeddings,
 )
+
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import END, MessagesState, START, StateGraph
 from langgraph.store.sqlite import SqliteStore
 from langgraph.types import Command, interrupt
 
 
-# 대화 목록과 저장소 파일 경로
+# 대화 목록과 데이터베이스 파일 경로입니다.
 THREADS_FILE = Path("threads.json")
 CHECKPOINT_DB = "agent_memory.sqlite"
 PROFILE_DB = "agent_profile.sqlite"
 
-# 로컬 사용자 한 명을 가정합니다.
+# 이 학습용 예제는 로컬 사용자 한 명을 가정합니다.
 USER_ID = "local-user"
 
-# Store에서 사용할 사용자별 데이터 공간
+# LangGraph Store에서 사용자 데이터를 분류할 namespace입니다.
 PROFILE_NAMESPACE = (USER_ID, "profile")
 MEMORIES_NAMESPACE = (USER_ID, "memories")
 SETTINGS_NAMESPACE = (USER_ID, "settings")
+
+# 기존 기억을 임베딩 인덱스에 등록했는지 확인하는 key입니다.
 INDEX_MARKER_KEY = "gemini-embedding-001-indexed"
+
+
+class RouteDecision(BaseModel):
+    """Router가 반환해야 하는 분류 결과의 형식입니다."""
+
+    category: Literal["time", "memory", "save_memory", "chat"] = Field(
+        description=(
+            "time은 현재 날짜나 시간 질문, "
+            "memory는 프로필이나 저장한 기억 검색, "
+            "save_memory는 새로운 기억 저장 요청, "
+            "chat은 그 외 일반 대화"
+        )
+    )
+    query: str = Field(
+        description="전문가나 다음 노드가 처리할 핵심 요청"
+    )
+
+
+class AgentState(MessagesState, total=False):
+    """대화 메시지와 Router의 분류 결과를 보관하는 그래프 상태입니다."""
+
+    route: Literal["time", "memory", "save_memory", "chat"]
+    route_query: str
 
 
 @tool
 def get_current_time() -> str:
     """사용자가 현재 날짜나 시간을 물으면 현재 날짜와 시간을 알려준다."""
+
+    # 현재 시스템의 로컬 시간대를 적용해 문자열로 반환합니다.
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def make_save_memory_tool(store):
-    """승인을 받은 뒤 장기 기억을 저장하는 도구를 만듭니다."""
-
-    @tool
-    def save_memory(text: str) -> str:
-        """사용자가 기억해 달라고 한 정보를 승인받은 뒤 장기 기억에 저장한다."""
-
-        # 저장 전에 그래프를 멈추고 사용자에게 승인 정보를 전달합니다.
-        decision = interrupt(
-            {
-                "action": "save_memory",
-                "text": text,
-                "message": "이 내용을 장기 기억에 저장할까요?",
-            }
-        )
-
-        # 승인하지 않았다면 Store를 수정하지 않습니다.
-        if decision.get("action") != "approve":
-            return "사용자가 기억 저장을 취소했습니다."
-
-        # 사용자가 수정해서 승인한 내용이 있으면 수정본을 사용합니다.
-        approved_text = decision.get("text", text).strip()
-
-        if not approved_text:
-            return "저장할 내용이 비어 있어 저장하지 않았습니다."
-
-        # 각 기억을 구분할 ID를 만들고 Store에 저장합니다.
-        memory_id = str(uuid4())
-        store.put(
-            MEMORIES_NAMESPACE,
-            memory_id,
-            {"text": approved_text},
-            index=["text"],
-        )
-
-        return f"기억을 저장했습니다. 기억 ID: {memory_id}"
-
-    return save_memory
-
-
-def make_memory_search_tool(store):
-    """사용자 프로필과 장기 기억을 검색하는 도구를 만듭니다."""
-
-    @tool
-    def search_saved_memories(query: str) -> str:
-        """사용자의 프로필과 장기 기억에서 질문과 관련된 정보를 찾는다."""
-
-        results = []
-
-        # 이름 프로필이 있으면 검색 결과에 포함합니다.
-        profile = store.get(PROFILE_NAMESPACE, "basic")
-        if profile:
-            name = profile.value.get("name")
-            if name:
-                results.append(f"사용자 이름: {name}")
-
-        # 입력한 문장과 의미가 가까운 기억을 검색합니다.
-        memories = store.search(
-            MEMORIES_NAMESPACE,
-            query=query,
-            limit=3,
-        )
-
-        for item in memories:
-            text = item.value.get("text")
-            if text:
-                results.append(text)
-
-        if not results:
-            return "관련된 프로필이나 장기 기억을 찾지 못했습니다."
-
-        # 검색 결과만 전문 에이전트에게 반환합니다.
-        return "\n".join(f"- {item}" for item in results)
-
-    return search_saved_memories
-
-
 def get_text(content) -> str:
-    """모델 응답에서 텍스트만 꺼냅니다."""
+    """LangChain 메시지 content에서 텍스트만 추출합니다."""
 
+    # content가 문자열이면 그대로 사용합니다.
     if isinstance(content, str):
         return content
 
+    # content가 여러 블록이면 text 유형 블록만 이어 붙입니다.
     if isinstance(content, list):
         return "".join(
             block.get("text", "")
@@ -127,17 +84,19 @@ def get_text(content) -> str:
             if isinstance(block, dict) and block.get("type") == "text"
         )
 
+    # 예상하지 못한 형식은 문자열로 바꿉니다.
     return str(content)
 
 
 def load_thread_registry() -> dict:
-    """대화 목록과 현재 선택된 대화 ID를 불러옵니다."""
+    """대화 목록을 JSON 파일에서 불러옵니다."""
 
     if THREADS_FILE.exists():
         try:
             with THREADS_FILE.open("r", encoding="utf-8") as file:
                 registry = json.load(file)
 
+            # 필요한 데이터 구조가 있는지 확인합니다.
             if (
                 isinstance(registry, dict)
                 and isinstance(registry.get("threads"), dict)
@@ -145,6 +104,7 @@ def load_thread_registry() -> dict:
             ):
                 active_id = registry.get("active_thread_id")
 
+                # 활성 대화 ID가 목록에 없으면 첫 대화를 선택합니다.
                 if active_id not in registry["threads"]:
                     registry["active_thread_id"] = next(
                         iter(registry["threads"])
@@ -155,8 +115,8 @@ def load_thread_registry() -> dict:
         except (json.JSONDecodeError, OSError):
             print("대화 목록 파일을 읽을 수 없어 새 목록을 만들게요.")
 
+    # 대화 목록이 없으면 첫 대화를 만듭니다.
     first_thread_id = str(uuid4())
-
     return {
         "active_thread_id": first_thread_id,
         "threads": {first_thread_id: "대화 1"},
@@ -171,7 +131,7 @@ def save_thread_registry(registry: dict) -> None:
 
 
 def print_threads(registry: dict) -> None:
-    """대화 목록과 현재 선택된 대화를 출력합니다."""
+    """대화 이름과 ID를 화면에 출력합니다."""
 
     active_id = registry["active_thread_id"]
     print("대화 목록:")
@@ -186,12 +146,13 @@ def reindex_existing_memories(store) -> None:
 
     marker = store.get(SETTINGS_NAMESPACE, INDEX_MARKER_KEY)
 
-    # 이미 인덱싱한 경우 다시 처리하지 않습니다.
+    # 이미 인덱싱을 마쳤으면 반복하지 않습니다.
     if marker:
         return
 
     old_memories = store.search(MEMORIES_NAMESPACE, limit=1000)
 
+    # 기존 각 기억의 text 필드를 검색 인덱스에 포함합니다.
     for item in old_memories:
         if item.value.get("text"):
             store.put(
@@ -201,7 +162,7 @@ def reindex_existing_memories(store) -> None:
                 index=["text"],
             )
 
-    # 완료 여부를 기록해 다음 실행 때 반복하지 않게 합니다.
+    # 완료 표시를 저장해 다음 실행에서 다시 처리하지 않게 합니다.
     store.put(
         SETTINGS_NAMESPACE,
         INDEX_MARKER_KEY,
@@ -210,13 +171,65 @@ def reindex_existing_memories(store) -> None:
     )
 
 
-def build_supervisor(model, store, save_memory_tool, checkpointer):
-    """시간·기억 전문 에이전트를 만들고 Supervisor에 연결합니다."""
+def make_memory_search_tool(store):
+    """기억 전문가가 사용할 Store 검색 도구를 만듭니다."""
 
-    # 기억 전문가가 사용할 검색 도구를 만듭니다.
-    memory_search_tool = make_memory_search_tool(store)
+    @tool
+    def search_saved_memories(query: str) -> str:
+        """사용자 프로필과 장기 기억에서 질문과 관련된 내용을 검색한다."""
 
-    # 시간 전문가: 현재 시간 도구만 사용합니다.
+        results = []
+
+        # 이름 프로필이 저장되어 있으면 검색 결과에 함께 포함합니다.
+        profile = store.get(PROFILE_NAMESPACE, "basic")
+        if profile:
+            name = profile.value.get("name")
+            if name:
+                results.append(f"사용자 이름: {name}")
+
+        # 검색어와 의미가 가까운 기억을 최대 3개 찾습니다.
+        memories = store.search(
+            MEMORIES_NAMESPACE,
+            query=query,
+            limit=3,
+        )
+
+        for item in memories:
+            text = item.value.get("text")
+            if text:
+                results.append(text)
+
+        if not results:
+            return "관련된 프로필이나 장기 기억을 찾지 못했습니다."
+
+        # 도구 결과를 전문 에이전트가 읽을 문자열로 변환합니다.
+        return "\n".join(f"- {item}" for item in results)
+
+    return search_saved_memories
+
+
+def make_router(model):
+    """사용자 요청을 네 가지 처리 경로 중 하나로 분류하는 Router를 만듭니다."""
+
+    return create_agent(
+        model=model,
+        tools=[],
+        response_format=RouteDecision,
+        system_prompt=(
+            "사용자 요청의 의도를 분류해. "
+            "현재 날짜나 시간이 궁금하면 time을 선택해. "
+            "저장된 사용자 정보나 기억을 찾으면 memory를 선택해. "
+            "새로운 정보를 기억해 달라는 요청이면 save_memory를 선택해. "
+            "그 외에는 chat을 선택해. "
+            "최근 대화의 대명사나 생략된 표현도 참고해서 query를 완성해."
+        ),
+    )
+
+
+def make_specialist_agents(model, store):
+    """시간 전문가와 기억 전문가 에이전트를 만듭니다."""
+
+    # 시간 전문가에게는 현재 시간 도구만 제공합니다.
     time_expert = create_agent(
         model=model,
         tools=[get_current_time],
@@ -227,60 +240,168 @@ def build_supervisor(model, store, save_memory_tool, checkpointer):
         ),
     )
 
-    # 기억 전문가: 사용자 기억 검색 도구만 사용합니다.
+    # 기억 전문가에게는 Store 검색 도구만 제공합니다.
+    memory_search_tool = make_memory_search_tool(store)
+
     memory_expert = create_agent(
         model=model,
         tools=[memory_search_tool],
         system_prompt=(
-            "너는 사용자의 장기 기억을 검색하는 전문가야. "
-            "질문과 관련된 기억을 검색하고, 검색 결과에 없는 내용은 "
-            "지어내지 마. 검색 결과를 간결하게 보고해."
+            "너는 사용자의 프로필과 장기 기억을 검색하는 전문가야. "
+            "질문과 관련된 기억을 검색해. "
+            "검색 결과에 없는 정보는 지어내지 말고, "
+            "찾지 못했으면 찾지 못했다고 말해."
         ),
     )
 
-    # Supervisor가 시간 전문가를 도구처럼 부를 수 있게 감쌉니다.
-    @tool
-    def ask_time_expert(question: str) -> str:
-        """현재 날짜나 시간에 관한 질문을 시간 전문가에게 맡긴다."""
+    return time_expert, memory_expert
+
+
+def build_graph(model, store, checkpointer):
+    """Router, 전문가 에이전트, 승인 노드를 하나의 그래프로 연결합니다."""
+
+    # Router는 분류 결과를 구조화된 Pydantic 객체로 반환합니다.
+    router = make_router(model)
+
+    # 각 전문 에이전트는 자기 역할에 맞는 도구만 가집니다.
+    time_expert, memory_expert = make_specialist_agents(model, store)
+
+    def classify_request(state: AgentState):
+        """최근 대화 내용을 보고 요청 종류와 처리 문장을 분류합니다."""
+
+        # 최근 대화 몇 개를 Router에 전달해 생략 표현을 해석하도록 합니다.
+        recent_messages = state["messages"][-8:]
+
+        route_result = router.invoke(
+            {"messages": recent_messages}
+        )
+
+        decision = route_result["structured_response"]
+
+        # 구조화된 분류 결과를 그래프 상태에 기록합니다.
+        return {
+            "route": decision.category,
+            "route_query": decision.query,
+        }
+
+    def run_time_expert(state: AgentState):
+        """시간 전문가를 실행하고 결과를 부모 그래프 메시지에 추가합니다."""
 
         result = time_expert.invoke(
-            {"messages": [HumanMessage(content=question)]}
+            {
+                "messages": [
+                    HumanMessage(content=state["route_query"])
+                ]
+            }
         )
 
-        return get_text(result["messages"][-1].content)
+        answer = get_text(result["messages"][-1].content)
 
-    # Supervisor가 기억 전문가를 도구처럼 부를 수 있게 감쌉니다.
-    @tool
-    def ask_memory_expert(question: str) -> str:
-        """사용자 프로필이나 장기 기억에 관한 질문을 기억 전문가에게 맡긴다."""
+        # 전문가의 최종 답변을 메인 대화 상태에 기록합니다.
+        return {"messages": [AIMessage(content=answer)]}
+
+    def run_memory_expert(state: AgentState):
+        """기억 전문가를 실행하고 결과를 메인 대화에 추가합니다."""
 
         result = memory_expert.invoke(
-            {"messages": [HumanMessage(content=question)]}
+            {
+                "messages": [
+                    HumanMessage(content=state["route_query"])
+                ]
+            }
         )
 
-        return get_text(result["messages"][-1].content)
+        answer = get_text(result["messages"][-1].content)
 
-    # Supervisor는 요청을 직접 처리하거나 적절한 전문가에게 위임합니다.
-    supervisor = create_agent(
-        model=model,
-        tools=[
-            ask_time_expert,
-            ask_memory_expert,
-            save_memory_tool,
-        ],
-        system_prompt=(
-            "너는 한국어로 답하는 친절한 Supervisor야. "
-            "현재 날짜나 시간 질문은 ask_time_expert에 맡겨. "
-            "사용자의 이름이나 장기 기억에 관한 질문은 "
-            "ask_memory_expert에 맡겨. "
-            "사용자가 명시적으로 기억해 달라고 요청하면 save_memory를 사용해. "
-            "간단한 인사나 일반 질문은 직접 답해. "
-            "전문가가 돌려준 결과를 바탕으로 사용자에게 최종 답변을 해."
-        ),
-        checkpointer=checkpointer,
+        return {"messages": [AIMessage(content=answer)]}
+
+    def save_memory_with_approval(state: AgentState):
+        """기억 저장 전에 멈춰서 사용자 승인을 받습니다."""
+
+        requested_text = state["route_query"].strip()
+
+        # 사용자가 저장하려는 내용을 확인할 수 있도록 그래프를 중지합니다.
+        decision = interrupt(
+            {
+                "action": "save_memory",
+                "text": requested_text,
+                "message": "이 내용을 장기 기억에 저장할까요?",
+            }
+        )
+
+        if decision.get("action") != "approve":
+            answer = "알겠습니다. 이 내용은 장기 기억에 저장하지 않았습니다."
+            return {"messages": [AIMessage(content=answer)]}
+
+        # 승인하면서 내용을 수정했다면 수정된 값을 사용합니다.
+        approved_text = decision.get("text", requested_text).strip()
+
+        if not approved_text:
+            answer = "저장할 내용이 비어 있어 저장하지 않았습니다."
+            return {"messages": [AIMessage(content=answer)]}
+
+        memory_id = str(uuid4())
+
+        # 승인된 내용만 Store에 기록하고 임베딩 검색 대상으로 지정합니다.
+        store.put(
+            MEMORIES_NAMESPACE,
+            memory_id,
+            {"text": approved_text},
+            index=["text"],
+        )
+
+        answer = f"기억을 저장했어요. 기억 ID: {memory_id}"
+        return {"messages": [AIMessage(content=answer)]}
+
+    def answer_general_chat(state: AgentState):
+        """일반 대화 경로에서 Gemini가 답변을 만듭니다."""
+
+        response = model.invoke(
+            [
+                SystemMessage(
+                    content="너는 한국어로 답하는 친절한 AI 에이전트야."
+                ),
+                *state["messages"],
+            ]
+        )
+
+        return {"messages": [response]}
+
+    # 각 분류 결과를 어느 그래프 노드로 보낼지 정합니다.
+    route_map = {
+        "time": "time_expert",
+        "memory": "memory_expert",
+        "save_memory": "save_memory",
+        "chat": "chat",
+    }
+
+    builder = StateGraph(AgentState)
+
+    # 그래프의 각 작업을 노드로 등록합니다.
+    builder.add_node("classify", classify_request)
+    builder.add_node("time_expert", run_time_expert)
+    builder.add_node("memory_expert", run_memory_expert)
+    builder.add_node("save_memory", save_memory_with_approval)
+    builder.add_node("chat", answer_general_chat)
+
+    # 새 입력은 먼저 Router로 보냅니다.
+    builder.add_edge(START, "classify")
+
+    # Router 결과를 보고 Python 코드가 분기 경로를 선택합니다.
+    builder.add_conditional_edges(
+        "classify",
+        lambda state: state["route"],
+        route_map,
     )
 
-    return supervisor
+    # 각 작업이 끝나면 그래프를 종료합니다.
+    builder.add_edge("time_expert", END)
+    builder.add_edge("memory_expert", END)
+    builder.add_edge("save_memory", END)
+    builder.add_edge("chat", END)
+
+    # 체크포인터를 연결해 thread별 대화 상태를 저장합니다.
+    return builder.compile(checkpointer=checkpointer)
 
 
 def main():
@@ -294,18 +415,17 @@ def main():
         model="gemini-embedding-001",
     )
 
-    # 대화 이름과 현재 대화 ID를 불러옵니다.
+    # 저장된 대화 목록을 불러옵니다.
     registry = load_thread_registry()
 
-    print("Gemini 멀티 에이전트 시작")
+    print("Gemini 구조화 라우터 에이전트")
     print("종료하려면 '종료'를 입력하세요.")
     print("대화: /new, /threads, /thread, /use 대화ID")
     print("프로필: /remember-name 이름, /profile")
     print("기억: /remember-fact 내용, /memories, /search-fact 검색어")
     print("기억 수정/삭제: /update-fact 기억ID 새내용, /forget 기억ID")
-    print("일반 대화에서 기억 저장을 요청하면 승인을 받습니다.")
 
-    # 장기 기억 Store를 엽니다.
+    # 장기 기억과 사용자 프로필 Store를 엽니다.
     with SqliteStore.from_conn_string(
         PROFILE_DB,
         index={
@@ -317,16 +437,11 @@ def main():
         store.setup()
         reindex_existing_memories(store)
 
-        # 승인 절차가 포함된 기억 저장 도구를 만듭니다.
-        save_memory_tool = make_save_memory_tool(store)
-
-        # 대화 상태를 저장하는 체크포인터를 엽니다.
+        # 대화 체크포인터를 엽니다.
         with SqliteSaver.from_conn_string(CHECKPOINT_DB) as checkpointer:
-            # Supervisor와 전문 에이전트를 만듭니다.
-            supervisor = build_supervisor(
+            graph = build_graph(
                 model=model,
                 store=store,
-                save_memory_tool=save_memory_tool,
                 checkpointer=checkpointer,
             )
 
@@ -344,7 +459,7 @@ def main():
                     print("에이전트: 다음에 또 만나요!")
                     break
 
-                # 새 대화를 만들고 활성 대화로 지정합니다.
+                # 새 대화를 만들어 현재 thread로 선택합니다.
                 if user_message == "/new":
                     new_thread_id = str(uuid4())
                     title = f"대화 {len(registry['threads']) + 1}"
@@ -356,17 +471,17 @@ def main():
                     print(f"새 대화를 시작했어요: {new_thread_id}")
                     continue
 
-                # 등록된 대화를 모두 보여줍니다.
+                # 대화 목록을 출력합니다.
                 if user_message == "/threads":
                     print_threads(registry)
                     continue
 
-                # 현재 선택된 대화 ID를 보여줍니다.
+                # 현재 대화 ID를 출력합니다.
                 if user_message == "/thread":
                     print(f"현재 대화 ID: {registry['active_thread_id']}")
                     continue
 
-                # 지정한 ID의 대화로 전환합니다.
+                # 기존 대화로 전환합니다.
                 if user_message.startswith("/use "):
                     requested_id = user_message.removeprefix("/use ").strip()
 
@@ -381,8 +496,69 @@ def main():
                         print("대화 ID를 찾을 수 없어요. /threads로 확인해 주세요.")
                     continue
 
-                # 기억 검색 명령은 모델에 보내지 않고 Python에서 처리합니다.
-                if user_message.startswith("/search-fact"):
+                # 사용자 이름을 프로필 Store에 저장합니다.
+                if user_message.startswith("/remember-name"):
+                    name = user_message.removeprefix("/remember-name").strip()
+
+                    if not name:
+                        print("사용법: /remember-name 이름")
+                        continue
+
+                    store.put(
+                        PROFILE_NAMESPACE,
+                        "basic",
+                        {"name": name},
+                        index=False,
+                    )
+                    print(f"이름 '{name}'을 저장했어요.")
+                    continue
+
+                # 프로필 이름을 확인합니다.
+                if user_message == "/profile":
+                    profile = store.get(PROFILE_NAMESPACE, "basic")
+
+                    if profile:
+                        print(f"저장된 프로필: {profile.value}")
+                    else:
+                        print("저장된 프로필이 없어요.")
+                    continue
+
+                # 기억을 직접 추가합니다.
+                if user_message.startswith("/remember-fact "):
+                    text = user_message.removeprefix("/remember-fact ").strip()
+
+                    if not text:
+                        print("사용법: /remember-fact 기억할 내용")
+                        continue
+
+                    memory_id = str(uuid4())
+                    store.put(
+                        MEMORIES_NAMESPACE,
+                        memory_id,
+                        {"text": text},
+                        index=["text"],
+                    )
+                    print(f"기억을 저장했어요. ID: {memory_id}")
+                    continue
+
+                # 저장된 기억 전체를 조회합니다.
+                if user_message == "/memories":
+                    items = store.search(MEMORIES_NAMESPACE, limit=50)
+
+                    if not items:
+                        print("저장된 기억이 없어요.")
+                    else:
+                        for item in items:
+                            print(
+                                f"- ID: {item.key} | "
+                                f"내용: {item.value.get('text', '')}"
+                            )
+                    continue
+
+                # 기억 검색 명령을 직접 처리합니다.
+                if user_message == "/search-fact" or user_message.startswith(
+                    "/search-fact "
+                ):
                     query = user_message.removeprefix("/search-fact").strip()
 
                     if not query:
@@ -405,66 +581,7 @@ def main():
                             )
                     continue
 
-                # 사용자 이름을 프로필에 저장합니다.
-                if user_message.startswith("/remember-name"):
-                    name = user_message.removeprefix("/remember-name").strip()
-
-                    if not name:
-                        print("사용법: /remember-name 이름")
-                        continue
-
-                    store.put(
-                        PROFILE_NAMESPACE,
-                        "basic",
-                        {"name": name},
-                        index=False,
-                    )
-                    print(f"이름 '{name}'을 장기 기억에 저장했어요.")
-                    continue
-
-                # 저장된 프로필을 확인합니다.
-                if user_message == "/profile":
-                    profile = store.get(PROFILE_NAMESPACE, "basic")
-
-                    if profile:
-                        print(f"저장된 프로필: {profile.value}")
-                    else:
-                        print("저장된 프로필이 없어요.")
-                    continue
-
-                # 기억을 직접 추가합니다. 이 명령은 명시적 요청이므로 바로 저장합니다.
-                if user_message.startswith("/remember-fact "):
-                    text = user_message.removeprefix("/remember-fact ").strip()
-
-                    if not text:
-                        print("사용법: /remember-fact 기억할 내용")
-                        continue
-
-                    memory_id = str(uuid4())
-                    store.put(
-                        MEMORIES_NAMESPACE,
-                        memory_id,
-                        {"text": text},
-                        index=["text"],
-                    )
-                    print(f"기억을 저장했어요. ID: {memory_id}")
-                    continue
-
-                # 저장된 기억 전체를 확인합니다.
-                if user_message == "/memories":
-                    items = store.search(MEMORIES_NAMESPACE, limit=50)
-
-                    if not items:
-                        print("저장된 기억이 없어요.")
-                    else:
-                        for item in items:
-                            print(
-                                f"- ID: {item.key} | "
-                                f"내용: {item.value.get('text', '')}"
-                            )
-                    continue
-
-                # 기억 내용을 수정합니다.
+                # 지정한 기억의 내용을 수정합니다.
                 if user_message.startswith("/update-fact "):
                     parts = user_message.split(maxsplit=2)
 
@@ -504,7 +621,7 @@ def main():
                         print("기억을 삭제했어요.")
                     continue
 
-                # 현재 대화의 체크포인터 ID를 지정합니다.
+                # 현재 대화 ID가 체크포인터의 thread_id가 됩니다.
                 active_thread_id = registry["active_thread_id"]
                 config = {
                     "configurable": {"thread_id": active_thread_id},
@@ -512,13 +629,13 @@ def main():
                 }
 
                 try:
-                    # 명령이 아닌 사용자 입력은 Supervisor에게 보냅니다.
-                    result = supervisor.invoke(
+                    # 일반 사용자 입력을 그래프에 전달합니다.
+                    result = graph.invoke(
                         {"messages": [HumanMessage(content=user_message)]},
                         config=config,
                     )
 
-                    # 기억 저장 도구가 승인을 요청하면 입력을 받아 그래프를 재개합니다.
+                    # 기억 저장 노드가 승인을 기다리면 사용자에게 확인합니다.
                     while result.get("__interrupt__"):
                         pending = result["__interrupt__"][0].value
 
@@ -539,12 +656,13 @@ def main():
                         else:
                             resume_value = {"action": "reject"}
 
-                        result = supervisor.invoke(
+                        # 같은 thread의 중단된 그래프를 재개합니다.
+                        result = graph.invoke(
                             Command(resume=resume_value),
                             config=config,
                         )
 
-                    # 그래프 결과에서 텍스트 답변을 꺼냅니다.
+                    # 그래프의 마지막 메시지를 사용자에게 출력합니다.
                     answer = get_text(result["messages"][-1].content)
                     print(f"에이전트: {answer}")
 
